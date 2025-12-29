@@ -1,22 +1,19 @@
+from __future__ import annotations
+
 from pathlib import Path
-import os
-import time
-import json
-import base64
-import hmac
-import hashlib
-import re
+import os, time, json, base64, hmac, hashlib, re
 from io import BytesIO
+from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional
 
-import pandas as pd
 import openpyxl
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from jinja2 import Template
 
+
 # ==========================================================
-# BASISPFADE (Projekt-ROOT)
+# PATHS + CONFIG
 # ==========================================================
 BASE_DIR = Path(__file__).resolve().parent
 ROOT = BASE_DIR / "ROOT"
@@ -26,22 +23,37 @@ SCALE_XLSX = ROOT / "3. SCM-Anwendungen(MA)_Gesamtbewertung.xlsx"
 SUBMISSIONS_DIR = ROOT / "Form_Submissions"
 SUBMISSIONS_DIR.mkdir(exist_ok=True)
 
-# ==========================================================
-# KONFIG
-# ==========================================================
 APP_SECRET = os.getenv("SCM_FORM_SECRET", "CHANGE_ME_SECRET")
 BASE_URL = os.getenv("SCM_FORM_BASE_URL", "http://localhost:8000")
 TOKEN_TTL = int(os.getenv("SCM_TOKEN_TTL_SECONDS", str(7 * 24 * 3600)))
-
 SCALE_SHEET = os.getenv("SCM_SCALE_SHEET", "Skala")
 
 SOURCE_COL_NAME = "Datenherkunft / Bewertung"
 SOURCE_MANUAL_VALUE = "Manuelle Bewertung"
 
 CACHE_TTL = 30
-_CACHE = {"ts": 0.0, "scale": None, "manual": None}
 
 app = FastAPI(title="SCM Form Backend")
+
+
+# ==========================================================
+# SMALL HELPERS
+# ==========================================================
+def norm(s: Any) -> str:
+    s = "" if s is None else str(s)
+    s = s.replace("\u00A0", " ").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+def clean(s: Any) -> str:
+    return "" if s is None else str(s).strip()
+
+def sanitize_filename_part(s: Any) -> str:
+    return re.sub(r"[^\w\-]", "_", clean(s))
+
+def submission_path(round_id: str, supplier_id: str) -> Path:
+    return SUBMISSIONS_DIR / f"submission_{sanitize_filename_part(supplier_id)}_R{sanitize_filename_part(round_id)}.json"
+
 
 # ==========================================================
 # TOKEN (HMAC)
@@ -79,164 +91,113 @@ def read_token(token: str) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"invalid token: {e}")
 
-# ==========================================================
-# Helpers
-# ==========================================================
-def _norm(s) -> str:
-    s = "" if s is None else str(s)
-    s = s.replace("\u00A0", " ")
-    s = s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    s = re.sub(r"\s+", " ", s).strip().lower()
-    return s
-
-def _clean(s) -> str:
-    if s is None or (isinstance(s, float) and pd.isna(s)):
-        return ""
-    return str(s).strip()
 
 # ==========================================================
-# SCALE laden (Skala-Tabelle)
-# Header: Zeile 4: Kriterium | Berechnung | Datenherkunft | N/A | 0..100
-# Daten ab Zeile 5
+# SCALE + MANUAL CRITERIA (single pass openpyxl)
 # ==========================================================
-def load_scale() -> Dict[str, Dict[int, str]]:
+def _find_header(ws, header_contains: str) -> Tuple[int, int]:
+    tgt = norm(header_contains)
+    for row in ws.iter_rows(values_only=False):
+        for cell in row:
+            if cell.value is None:
+                continue
+            if tgt in norm(cell.value):
+                return cell.row, cell.column
+    raise HTTPException(500, f"Header '{header_contains}' nicht gefunden (Sheet '{ws.title}').")
+
+def _find_col_in_row(ws, row: int, needle_contains: str) -> Optional[int]:
+    tgt = norm(needle_contains)
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row, c).value
+        if v is not None and tgt in norm(v):
+            return c
+    return None
+
+def load_scale_and_manual() -> Tuple[Dict[str, Dict[int, str]], List[str]]:
     if not SCALE_XLSX.exists():
         raise HTTPException(500, f"Excel nicht gefunden: {SCALE_XLSX}")
 
-    df = pd.read_excel(SCALE_XLSX, sheet_name=SCALE_SHEET, header=None)
-
-    scale: Dict[str, Dict[int, str]] = {}
-    for i in range(4, len(df)):  # ab Zeile 5 (0-index 4)
-        crit = _clean(df.iloc[i, 0])
-        if not crit or _norm(crit) in ("nan", "none"):
-            continue
-
-        scale[crit] = {
-            0: _clean(df.iloc[i, 4]),
-            20: _clean(df.iloc[i, 5]),
-            40: _clean(df.iloc[i, 6]),
-            60: _clean(df.iloc[i, 7]),
-            80: _clean(df.iloc[i, 8]),
-            100: _clean(df.iloc[i, 9]),
-        }
-    return scale
-
-# ==========================================================
-# Manuelle Kriterien DIREKT aus Skala-Sheet (openpyxl, zellbasiert)
-# Regel: Spalte 'Datenherkunft / Bewertung' == 'Manuelle Bewertung'
-# Keine Überschriften: dort ist Datenherkunft leer -> fällt automatisch raus
-# ==========================================================
-def extract_manual_criteria_from_workbook(scale: Dict[str, Dict[int, str]]) -> List[str]:
     wb = openpyxl.load_workbook(SCALE_XLSX, data_only=True)
-
     if SCALE_SHEET not in wb.sheetnames:
         raise HTTPException(500, f"Sheet '{SCALE_SHEET}' nicht gefunden in Excel.")
 
     ws = wb[SCALE_SHEET]
 
-    # 1) Header-Zelle "Datenherkunft / Bewertung" finden
-    header_row = None
-    src_col = None
-    crit_col = None
+    header_row, src_col = _find_header(ws, SOURCE_COL_NAME)
+    crit_col = _find_col_in_row(ws, header_row, "kriter") or 1
 
-    target_header = _norm(SOURCE_COL_NAME)
+    # Annahme wie bei dir: Skala-Spalten 0..100 sitzen ab Spalte 5 (E) bis 10 (J)
+    # (Weil du vorher df.iloc[i,4..9] genutzt hast)
+    scale_cols = {0: 5, 20: 6, 40: 7, 60: 8, 80: 9, 100: 10}
 
-    for row in ws.iter_rows(values_only=False):
-        for cell in row:
-            if cell.value is None:
-                continue
-            if target_header in _norm(cell.value):
-                header_row = cell.row
-                src_col = cell.column
-                break
-        if header_row is not None:
-            break
+    scale: Dict[str, Dict[int, str]] = {}
+    manual: List[str] = []
 
-    if header_row is None or src_col is None:
-        raise HTTPException(
-            500,
-            f"Header '{SOURCE_COL_NAME}' nicht gefunden (im Sheet '{SCALE_SHEET}')."
-        )
+    manual_marker = norm(SOURCE_MANUAL_VALUE)
 
-    # 2) In derselben Header-Zeile die Kriteriumsspalte finden (Zelle enthält "Kriterium")
-    for c in range(1, ws.max_column + 1):
-        v = ws.cell(header_row, c).value
-        if v is not None and "kriter" in _norm(v):
-            crit_col = c
-            break
-    if crit_col is None:
-        crit_col = 1  # fallback
-
-    # 3) Darunter Zeilen sammeln, wo src == "Manuelle Bewertung"
-    target_val = _norm(SOURCE_MANUAL_VALUE)
-
-    scale_keys = list(scale.keys())
-    scale_norm = [_norm(k) for k in scale_keys]
-
-    def match_to_scale(raw_crit) -> Optional[str]:
-        c = _norm(raw_crit)
-        if not c:
-            return None
-        for k, kn in zip(scale_keys, scale_norm):
-            if kn == c:
-                return k
-        for k, kn in zip(scale_keys, scale_norm):
-            if c in kn or kn in c:
-                return k
-        return None
-
-    found: List[str] = []
     for r in range(header_row + 1, ws.max_row + 1):
-        src_val = ws.cell(r, src_col).value
-        if _norm(src_val) != target_val:
+        crit = clean(ws.cell(r, crit_col).value)
+        if not crit or norm(crit) in ("nan", "none"):
             continue
 
-        crit_val = ws.cell(r, crit_col).value
-        matched = match_to_scale(crit_val)
-        if matched:
-            found.append(matched)
+        # Skala sammeln
+        scale[crit] = {pts: clean(ws.cell(r, col).value) for pts, col in scale_cols.items()}
 
-    # unique + Reihenfolge wie Skala
-    found = list(dict.fromkeys(found))
-    order = list(scale.keys())
-    found = [c for c in order if c in set(found)]
+        # Manual markieren
+        src_val = ws.cell(r, src_col).value
+        if norm(src_val) == manual_marker:
+            manual.append(crit)
 
-    if not found:
+    if not scale:
+        raise HTTPException(500, "Skala konnte nicht geladen werden (keine Kriterien gefunden).")
+
+    if not manual:
         raise HTTPException(
             500,
-            f"Header gefunden (Row {header_row}, Col {src_col}), aber keine Zeilen mit '{SOURCE_MANUAL_VALUE}' erkannt."
+            f"Header gefunden (Row {header_row}, Col {src_col}), aber keine Zeilen mit '{SOURCE_MANUAL_VALUE}'."
         )
 
-    return found
+    # unique, Reihenfolge wie Skala
+    manual = list(dict.fromkeys(manual))
+    return scale, manual
+
+
+@dataclass
+class _Cache:
+    ts: float = 0.0
+    scale: Optional[Dict[str, Dict[int, str]]] = None
+    manual: Optional[List[str]] = None
+
+_CACHE = _Cache()
 
 def get_scale_and_manual() -> Tuple[Dict[str, Dict[int, str]], List[str]]:
     now = time.time()
-    if _CACHE["scale"] is not None and (now - _CACHE["ts"]) < CACHE_TTL:
-        return _CACHE["scale"], _CACHE["manual"]
-
-    scale = load_scale()
-    manual = extract_manual_criteria_from_workbook(scale)
-
-    _CACHE["ts"] = now
-    _CACHE["scale"] = scale
-    _CACHE["manual"] = manual
+    if _CACHE.scale is not None and (now - _CACHE.ts) < CACHE_TTL:
+        return _CACHE.scale, _CACHE.manual or []
+    scale, manual = load_scale_and_manual()
+    _CACHE.ts, _CACHE.scale, _CACHE.manual = now, scale, manual
     return scale, manual
+
 
 # ==========================================================
 # XLSX Builder (für Bot)
 # ==========================================================
 def build_reply_xlsx(answers: Dict[str, int]) -> bytes:
-    df = pd.DataFrame(
-        [{"Kriterium": k, "Bewertung": int(v)} for k, v in answers.items()],
-        columns=["Kriterium", "Bewertung"]
-    )
+    # minimal: openpyxl direkt (spart pandas)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Antwort"
+    ws.append(["Kriterium", "Bewertung"])
+    for k, v in answers.items():
+        ws.append([k, int(v)])
+
     bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as w:
-        df.to_excel(w, index=False)
+    wb.save(bio)
     return bio.getvalue()
 
+
 # ==========================================================
-# Formular HTML
+# HTML Template
 # ==========================================================
 FORM_HTML = Template("""
 <!doctype html>
@@ -274,8 +235,9 @@ FORM_HTML = Template("""
               <input type="radio" name="c_{{ i }}" value="{{ pts }}" required />
               <b>{{ pts }}</b> Punkte
             </label>
-            {% if item.scale.get(pts, "") %}
-              <div class="desc">{{ item.scale.get(pts, "") }}</div>
+            {% set d = item.scale.get(pts, "") %}
+            {% if d %}
+              <div class="desc">{{ d }}</div>
             {% endif %}
           </div>
         {% endfor %}
@@ -291,23 +253,13 @@ FORM_HTML = Template("""
 </html>
 """)
 
-# ==========================================================
-# Storage (JSON)
-# ==========================================================
-def submission_path(round_id: str, supplier_id: str) -> Path:
-    rid = re.sub(r"[^\w\-]", "_", str(round_id))
-    sid = re.sub(r"[^\w\-]", "_", str(supplier_id))
-    return SUBMISSIONS_DIR / f"submission_{sid}_R{rid}.json"
 
+# ==========================================================
+# Storage
+# ==========================================================
 def save_submission(round_id: str, supplier_id: str, answers: Dict[str, int]) -> Dict[str, Any]:
-    p = submission_path(round_id, supplier_id)
-    data = {
-        "round_id": round_id,
-        "supplier_id": supplier_id,
-        "submitted_at": time.time(),
-        "answers": answers
-    }
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    data = {"round_id": round_id, "supplier_id": supplier_id, "submitted_at": time.time(), "answers": answers}
+    submission_path(round_id, supplier_id).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return data
 
 def load_submission(round_id: str, supplier_id: str) -> Dict[str, Any]:
@@ -315,6 +267,7 @@ def load_submission(round_id: str, supplier_id: str) -> Dict[str, Any]:
     if not p.exists():
         raise HTTPException(404, "submission not found")
     return json.loads(p.read_text(encoding="utf-8"))
+
 
 # ==========================================================
 # Routes
@@ -333,46 +286,38 @@ async def home():
 
 @app.get("/issue-link")
 async def issue_link(supplier_id: str, round_id: str):
-    supplier_id = _clean(supplier_id)
-    round_id = _clean(round_id)
+    supplier_id, round_id = clean(supplier_id), clean(round_id)
     if not supplier_id or not round_id:
         raise HTTPException(400, "missing supplier_id or round_id")
 
-    payload = {"supplier_id": supplier_id, "round_id": round_id, "exp": time.time() + TOKEN_TTL}
-    token = make_token(payload)
+    token = make_token({"supplier_id": supplier_id, "round_id": round_id, "exp": time.time() + TOKEN_TTL})
     url = f"{BASE_URL.rstrip('/')}/evaluate?token={token}"
     return JSONResponse({"url": url, "token": token})
 
 @app.get("/evaluate", response_class=HTMLResponse)
 async def evaluate(token: str):
     payload = read_token(token)
-    round_id = payload["round_id"]
-    supplier_id = payload["supplier_id"]
-
     scale, manual = get_scale_and_manual()
-    items = [{"crit": c, "scale": scale[c]} for c in manual]
 
+    items = [{"crit": c, "scale": scale[c]} for c in manual]
     html = FORM_HTML.render(
         token=token,
-        round_id=round_id,
-        supplier_id=supplier_id,
-        items=list(enumerate(items))
+        round_id=payload["round_id"],
+        supplier_id=payload["supplier_id"],
+        items=list(enumerate(items)),
     )
     return HTMLResponse(html)
 
 @app.post("/submit", response_class=HTMLResponse)
-async def submit(token: str = Form(...), request: Request = None):
+async def submit(request: Request, token: str = Form(...)):
     payload = read_token(token)
-    supplier_id = payload["supplier_id"]
-    round_id = payload["round_id"]
-
-    form = await request.form()
     scale, manual = get_scale_and_manual()
 
+    form = await request.form()
     answers: Dict[str, int] = {}
+
     for i, crit in enumerate(manual):
-        key = f"c_{i}"
-        val = form.get(key)
+        val = form.get(f"c_{i}")
         if val is None:
             raise HTTPException(400, f"missing answer for {crit}")
         pts = int(val)
@@ -380,30 +325,25 @@ async def submit(token: str = Form(...), request: Request = None):
             raise HTTPException(400, f"invalid scale value: {pts}")
         answers[crit] = pts
 
-    save_submission(round_id, supplier_id, answers)
+    save_submission(payload["round_id"], payload["supplier_id"], answers)
+    return HTMLResponse(
+        f"""
+        <h3>Danke! ✅</h3>
+        <p>Ihre Bewertung für <b>{payload["supplier_id"]}</b> (Runde <b>{payload["round_id"]}</b>) wurde gespeichert.</p>
+        <p>Sie können dieses Fenster jetzt schließen.</p>
+        """
+    )
 
-    return HTMLResponse(f"""
-      <h3>Danke! ✅</h3>
-      <p>Ihre Bewertung für <b>{supplier_id}</b> (Runde <b>{round_id}</b>) wurde gespeichert.</p>
-      <p>Sie können dieses Fenster jetzt schließen.</p>
-    """)
-
-# ==========================================================
-# Bot API
-# ==========================================================
 @app.get("/api/submissions")
 async def api_submissions(round_id: str):
-    round_id = _clean(round_id)
+    rid = clean(round_id)
     out = []
     for f in SUBMISSIONS_DIR.glob("submission_*_R*.json"):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-            if str(data.get("round_id")) == round_id:
-                out.append({
-                    "supplier_id": data.get("supplier_id"),
-                    "submitted_at": float(data.get("submitted_at", 0))
-                })
-        except:
+            if str(data.get("round_id")) == rid:
+                out.append({"supplier_id": data.get("supplier_id"), "submitted_at": float(data.get("submitted_at", 0))})
+        except Exception:
             continue
     out.sort(key=lambda x: x["submitted_at"])
     return JSONResponse(out)
@@ -411,10 +351,10 @@ async def api_submissions(round_id: str):
 @app.get("/api/xlsx")
 async def api_xlsx(round_id: str, supplier_id: str):
     data = load_submission(round_id, supplier_id)
-    answers = data.get("answers", {})
-    xlsx_bytes = build_reply_xlsx({k: int(v) for k, v in answers.items()})
+    answers = {k: int(v) for k, v in (data.get("answers") or {}).items()}
+    xlsx_bytes = build_reply_xlsx(answers)
     return Response(
         content=xlsx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="Antwort_{supplier_id}_R{round_id}.xlsx"'}
+        headers={"Content-Disposition": f'attachment; filename="Antwort_{supplier_id}_R{round_id}.xlsx"'},
     )
