@@ -413,6 +413,142 @@ def excel_next_free_supplier_column(ws, header_row=1, start_col=3, max_cols=400)
         c += 2
     raise RuntimeError("Keine freie Spalte mehr in Nutzwertanalyse (max_cols erreicht).")
 
+def excel_last_used_row(ws, min_row: int = 2, max_row: int = 800) -> int:
+    """Heuristik: letzte relevante Zeile (Kriterium/Section/Summe) finden."""
+    last = min_row
+    for r in range(min_row, max_row + 1):
+        a = ws.Cells(r, 1).Value
+        d_formula = ws.Cells(r, 4).Formula  # Template hat i.d.R. hier Formeln
+        if (a is not None and str(a).strip() != "") or (d_formula is not None and str(d_formula).strip().startswith("=")):
+            last = r
+    return last
+
+
+def excel_apply_template_pair_formats(
+    ws,
+    dest_bew_col: int,
+    dest_nutz_col: int,
+    template_bew_col: int = 3,
+    template_nutz_col: int = 4,
+    header_row_1: int = 1,
+    header_row_2: int = 2,
+) -> None:
+    """
+    Kopiert exakt das Layout/Design aus dem Template-Lieferantenpaar (C:D) auf ein neues Paar.
+    Dadurch: graue Zeilen + dicke Rahmen + Kopfzeilen-Merge wie im Screenshot.
+    """
+    last_row = excel_last_used_row(ws)
+
+    src = ws.Range(ws.Cells(1, template_bew_col), ws.Cells(last_row, template_nutz_col))
+    dst = ws.Range(ws.Cells(1, dest_bew_col), ws.Cells(last_row, dest_nutz_col))
+
+    # Optional: Fokus hilft manchmal bei PasteSpecial
+    try:
+        ws.Activate()
+    except Exception:
+        pass
+
+    # Nur Formate kopieren
+    src.Copy()
+    dst.PasteSpecial(Paste=-4122)  # xlPasteFormats
+
+    # Kopfzeile: Lieferant über 2 Spalten (Merge)
+    try:
+        hdr = ws.Range(ws.Cells(header_row_1, dest_bew_col), ws.Cells(header_row_1, dest_nutz_col))
+        if not hdr.MergeCells:
+            hdr.Merge()
+        hdr.Font.Bold = True
+        hdr.HorizontalAlignment = -4108  # xlCenter
+        hdr.VerticalAlignment = -4108
+        hdr.WrapText = True
+    except Exception:
+        pass
+
+    # Subheader in Zeile 2
+    try:
+        r2 = ws.Range(ws.Cells(header_row_2, dest_bew_col), ws.Cells(header_row_2, dest_nutz_col))
+        r2.Font.Bold = True
+        r2.HorizontalAlignment = -4108
+        r2.VerticalAlignment = -4108
+        r2.WrapText = True
+    except Exception:
+        pass
+
+    # Clipboard leeren
+    try:
+        ws.Application.CutCopyMode = False
+    except Exception:
+        pass
+
+def excel_create_nutzwert_chart(ws_nutzwert, wb):
+    """
+    Erstellt ein zweites Blatt mit Balkendiagramm (Nutzwerte je Lieferant)
+    """
+
+    # --- Diagrammblatt neu anlegen ---
+    chart_name = "Diagramm"
+    try:
+        wb.Worksheets(chart_name).Delete()
+    except Exception:
+        pass
+
+    ws_chart = wb.Worksheets.Add()
+    ws_chart.Name = chart_name
+
+    # --- Lieferanten + Nutzwerte sammeln ---
+    header_row = 1
+    sum_row = None
+
+    # Summe-Nutzwerte-Zeile finden
+    for r in range(3, 600):
+        val = ws_nutzwert.Cells(r, 1).Value
+        if val and "summe nutzwerte" in str(val).lower():
+            sum_row = r
+            break
+
+    if not sum_row:
+        raise RuntimeError("Summe Nutzwerte nicht gefunden")
+
+    data = []
+    col = 3  # erste Lieferantenspalte
+    while True:
+        supplier = ws_nutzwert.Cells(header_row, col).Value
+        if not supplier:
+            break
+
+        nutzwert = ws_nutzwert.Cells(sum_row, col + 1).Value
+        data.append((supplier, nutzwert))
+        col += 2
+
+    # --- Hilfstabelle schreiben ---
+    ws_chart.Cells(1, 1).Value = "Lieferant"
+    ws_chart.Cells(1, 2).Value = "Gesamtnutzwert"
+
+    for i, (name, value) in enumerate(data, start=2):
+        ws_chart.Cells(i, 1).Value = name
+        ws_chart.Cells(i, 2).Value = value
+
+    last_row = len(data) + 1
+
+    # --- Diagramm erzeugen ---
+    chart = wb.Charts.Add()
+    chart.ChartType = 51  # xlColumnClustered (Balkendiagramm)
+
+    chart.SetSourceData(
+        ws_chart.Range(ws_chart.Cells(1, 1), ws_chart.Cells(last_row, 2))
+    )
+
+    chart.HasTitle = True
+    chart.ChartTitle.Text = "Gesamtnutzwerte je Lieferant"
+
+    chart.Axes(1).HasTitle = True
+    chart.Axes(1).AxisTitle.Text = "Lieferanten"
+
+    chart.Axes(2).HasTitle = True
+    chart.Axes(2).AxisTitle.Text = "Nutzwert"
+
+    chart.Location(Where=2, Name=chart_name)  # xlLocationAsObject
+
 class ExcelApp:
     def __enter__(self):
         self.excel = win32.Dispatch("Excel.Application")
@@ -461,6 +597,11 @@ def upsert_supplier_into_nutzwert(
     col_bew, col_nutz = excel_find_supplier_column(ws, supplier_name, header_row=HEADER_ROW_1, start_col=start_col)
     if col_bew is None:
         col_bew, col_nutz = excel_next_free_supplier_column(ws, header_row=HEADER_ROW_1, start_col=start_col)
+
+        # Exakt den Stil wie im Template (Lieferant 1) übernehmen
+        excel_apply_template_pair_formats(ws, col_bew, col_nutz)
+
+        # Header setzen
         excel_set_value_safe(ws, HEADER_ROW_1, col_bew, supplier_name)
         excel_set_value_safe(ws, HEADER_ROW_2, col_bew, "Bewertung")
         excel_set_value_safe(ws, HEADER_ROW_2, col_nutz, "Nutzwert")
@@ -617,9 +758,12 @@ def phase_dispatch_links(config: Config, api: FormAPI, outlook: OutlookUI, state
             subject = f"SCM-Bewertung | Runde {state.round_id} | {s_id}"
             body = (
                 f"Hallo {name},\n\n"
-                f"bitte füllen Sie die Lieferantenbewertung über diesen Link aus:\n\n"
+                f"im Rahmen unseres aktuellen Lieferantenbewertungsprozesses bitten wir Sie, die Bewertung über den folgenden Link auszufüllen:\n\n"
                 f"{form_url}\n\n"
-                f"Vielen Dank!\n\n"
+                f"Bitte füllen Sie die Bewertung vollständig und sorgfältig aus. Die Bearbeitung dauert in der Regel nur wenige Minuten.\n\n"
+                f"Vielen Dank für Ihre Unterstützung.\n\n"
+                f"Freundliche Grüße\n"
+                f"Ihr SCM-Team\n\n"
                 f"(Runde {state.round_id})"
             )
             outlook.new_mail(email, subject, body)
@@ -723,6 +867,7 @@ def phase_finalize_nutzwert(config: Config, state: RoundState) -> Optional[Path]
         try:
             for s_name, report_path in suppliers:
                 upsert_supplier_into_nutzwert(excel, wb, ws, report_path, s_name)
+            excel_create_nutzwert_chart(ws, wb)
             wb.SaveAs(builtins.str(out_path))
             state.nutzwert_done = True
             state.save()
@@ -738,7 +883,15 @@ def phase_send_final_mail(outlook: OutlookUI, state: RoundState, to_email: str, 
     if state.final_mail_sent:
         return
     subject = f"SCM Nutzwertanalyse Runde {state.round_id}"
-    body = "Hi,\n\nanbei die Nutzwertanalyse.\n\nViele Grüße\nSCM Bot"
+    body = (
+        f"Hallo,\n\n"
+        f"anbei erhalten Sie die aktuelle Nutzwertanalyse zur Lieferantenbewertung (Runde {state.round_id}).\n\n"
+        f"Die Datei enthält die konsolidierten Ergebnisse aus den eingegangenen Bewertungen sowie den ERP-Daten.\n"
+        f"Bitte nutzen Sie die Auswertung als Entscheidungsgrundlage; die finale Lieferantenauswahl verbleibt bei Ihnen.\n\n"
+        f"Freundliche Grüße\n"
+        f"SCM Bot\n\n"
+        f"(Runde {state.round_id})"
+    )
     outlook.open_mail()
     outlook.new_mail_with_attachment(to_email, subject, body, attachment)
     state.final_mail_sent = True
